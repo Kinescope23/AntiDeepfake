@@ -3,12 +3,49 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 from infrastructure import ParameterSchema
 from module1 import Module1
 from train.config import TrainingConfig
-from train.dataset import AudioDataset
+from train.dataset import AudioDataset, load_asvspoof_dataset
 from train.losses import MultiScaleSpectralLoss
 from train.utils import save_checkpoint, setup_logging
+
+
+def synthesize_from_parameters(f0, harmonics, noise, schema):
+    """
+    Корректный синтез сигнала из кадровых параметров.
+    Сначала интерполирует кадровые признаки до частоты дискретизации,
+    затем накапливает фазу для каждой гармоники.
+    """
+    batch_size, num_frames, _ = f0.shape
+
+    # 1. Интерполяция кадровых признаков до уровня сэмплов (linear interpolation)
+    f0_up = torch.nn.functional.interpolate(
+        f0.transpose(1, 2), size=schema.num_samples, mode='linear', align_corners=True
+    ).transpose(1, 2)  # Форма: (batch_size, num_samples, 1)
+
+    harm_up = torch.nn.functional.interpolate(
+        harmonics.transpose(1, 2), size=schema.num_samples, mode='linear', align_corners=True
+    ).transpose(1, 2)  # Форма: (batch_size, num_samples, num_harmonics)
+
+    harmonic_signal = torch.zeros(batch_size, schema.num_samples, device=f0.device)
+
+    # 2. Аддитивный синтез первых 10 гармоник (для ускорения обучения на этапе реконструкции)
+    num_harmonics_to_synth = min(10, schema.num_harmonics)
+
+    for k in range(num_harmonics_to_synth):
+        # Частота k-й гармоники
+        freq = (k + 1) * f0_up  # Форма: (batch_size, num_samples, 1)
+
+        # Накопление фазы: d(phase)/dt = 2*pi*f. Интегрируем по времени (dim=1)
+        phase = 2 * torch.pi * torch.cumsum(freq, dim=1) / schema.sample_rate  # Форма: (batch_size, num_samples, 1)
+
+        # Умножаем амплитуду на синус фазы и добавляем к сигналу
+        amp = harm_up[:, :, k].unsqueeze(-1)  # Форма: (batch_size, num_samples, 1)
+        harmonic_signal += (amp * torch.sin(phase)).squeeze(-1)
+
+    return harmonic_signal
 
 
 def train_module1(
@@ -22,6 +59,10 @@ def train_module1(
         duration_seconds=config.duration_seconds
     )
 
+    # Очистка кэша CUDA перед началом для освобождения фрагментированной памяти
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     logger = setup_logging(config.log_dir)
     logger.info("Starting Module 1 training (Reconstruction)")
 
@@ -31,19 +72,24 @@ def train_module1(
         train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=config.num_workers
+        num_workers=config.num_workers,
+        pin_memory=True
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
-        num_workers=config.num_workers
+        num_workers=config.num_workers,
+        pin_memory=True
     )
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr_module1, weight_decay=config.weight_decay)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.num_epochs)
     criterion = MultiScaleSpectralLoss()
+
+    # Инициализация скалера для смешанной точности (AMP)
+    scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
     best_val_loss = float('inf')
 
@@ -51,36 +97,15 @@ def train_module1(
         model.train()
         train_loss = 0.0
 
-        for batch_audio, _ in train_loader:
-            batch_audio = batch_audio.to(device)
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{config.num_epochs} [Train]", leave=False)
 
-            optimizer.zero_grad()
+        for batch_audio, _ in train_pbar:
+            batch_audio = batch_audio.to(device, non_blocking=True)
 
-            parameters = model(batch_audio)
+            optimizer.zero_grad(set_to_none=True)
 
-            f0 = parameters['f0']
-            harmonics = parameters['harmonic_amplitudes']
-            noise = parameters['noise_magnitude']
-
-            reconstructed = synthesize_from_parameters(f0, harmonics, noise, schema)
-
-            loss = criterion(batch_audio, reconstructed)
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
-            optimizer.step()
-
-            train_loss += loss.item()
-
-        train_loss /= len(train_loader)
-
-        model.eval()
-        val_loss = 0.0
-
-        with torch.no_grad():
-            for batch_audio, _ in val_loader:
-                batch_audio = batch_audio.to(device)
-
+            # Включаем смешанную точность для прямого прохода
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
                 parameters = model(batch_audio)
 
                 f0 = parameters['f0']
@@ -88,9 +113,46 @@ def train_module1(
                 noise = parameters['noise_magnitude']
 
                 reconstructed = synthesize_from_parameters(f0, harmonics, noise, schema)
-
                 loss = criterion(batch_audio, reconstructed)
+
+            # Масштабируем потерю и делаем backward pass
+            scaler.scale(loss).backward()
+
+            # Анскейлим градиенты перед клиппингом
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+
+            # Делаем шаг оптимизатора и обновляем скалер
+            scaler.step(optimizer)
+            scaler.update()
+
+            train_loss += loss.item()
+            train_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        train_loss /= len(train_loader)
+
+        # Валидация
+        model.eval()
+        val_loss = 0.0
+
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{config.num_epochs} [Val]  ", leave=False)
+
+        with torch.no_grad():
+            for batch_audio, _ in val_pbar:
+                batch_audio = batch_audio.to(device, non_blocking=True)
+
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    parameters = model(batch_audio)
+
+                    f0 = parameters['f0']
+                    harmonics = parameters['harmonic_amplitudes']
+                    noise = parameters['noise_magnitude']
+
+                    reconstructed = synthesize_from_parameters(f0, harmonics, noise, schema)
+                    loss = criterion(batch_audio, reconstructed)
+
                 val_loss += loss.item()
+                val_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
         val_loss /= len(val_loader)
         scheduler.step()
@@ -102,35 +164,33 @@ def train_module1(
             save_checkpoint(model, optimizer, epoch, val_loss, config.checkpoint_dir, "module1_best.pth")
             logger.info(f"Saved best model with val loss: {val_loss:.4f}")
 
-
-def synthesize_from_parameters(f0, harmonics, noise, schema):
-    batch_size, num_frames, _ = f0.shape
-
-    harmonic_signal = torch.zeros(batch_size, schema.num_samples, device=f0.device)
-
-    for k in range(min(10, schema.num_harmonics)):
-        freq = (k + 1) * f0.squeeze(-1)
-        phase = 2 * torch.pi * torch.cumsum(freq, dim=1) / schema.sample_rate
-        harmonic_signal += harmonics[:, :, k].unsqueeze(-1) * torch.sin(phase)
-
-    return harmonic_signal
+        # Очистка кэша в конце эпохи для предотвращения фрагментации памяти
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
     config = TrainingConfig()
 
-    train_dataset = AudioDataset(
-        audio_files=["data/libritts/train/*.wav"],
-        labels=[0] * 1000,
+    train_dataset = load_asvspoof_dataset(
+        protocol_file="E:\\data\\ASVspoof2019LA\\CM_protocol\\CM_train.trn",
+        audio_dir="E:\\data\\ASVspoof2019LA\\WAV\\train",
         sample_rate=config.sample_rate,
         duration_seconds=config.duration_seconds
     )
 
-    val_dataset = AudioDataset(
-        audio_files=["data/libritts/val/*.wav"],
-        labels=[0] * 100,
+    val_dataset = load_asvspoof_dataset(
+        protocol_file="E:\\data\\ASVspoof2019LA\\CM_protocol\\CM_dev.trl",
+        audio_dir="E:\\data\\ASVspoof2019LA\\WAV\\dev",
         sample_rate=config.sample_rate,
         duration_seconds=config.duration_seconds
     )
+
+    print(f"Train dataset size: {len(train_dataset)}")
+    print(f"Val dataset size: {len(val_dataset)}")
+
+    if len(train_dataset) == 0:
+        print("ERROR: Train dataset is empty! Check paths and file extensions.")
+        exit(1)
 
     train_module1(config, train_dataset, val_dataset)

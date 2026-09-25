@@ -22,20 +22,34 @@ class AudioDataset(Dataset):
         return len(self.audio_files)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        import soundfile as sf
+        import numpy as np
+
         audio_path = self.audio_files[idx]
         label = self.labels[idx]
 
-        waveform, sr = torchaudio.load(audio_path)
+        # Читаем аудио напрямую через soundfile, обходя torchaudio.load
+        waveform_np, sr = sf.read(audio_path, dtype='float32')
+        waveform = torch.from_numpy(waveform_np)
 
+        # soundfile возвращает форму (samples,) для моно или (samples, channels) для стерео
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        else:
+            waveform = waveform.transpose(0, 1)  # Приводим к (channels, samples)
+
+        # Ресемплинг, если частота не 16000 Гц
         if sr != self.sample_rate:
             resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
             waveform = resampler(waveform)
 
+        # Преобразуем в моно
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
         waveform = waveform.squeeze()
 
+        # Обрезка или паддинг до нужной длины (4 секунды = 64000 сэмплов)
         if waveform.shape[0] < self.num_samples:
             pad_size = self.num_samples - waveform.shape[0]
             waveform = torch.nn.functional.pad(waveform, (0, pad_size))
@@ -55,22 +69,54 @@ def load_asvspoof_dataset(
     audio_files = []
     labels = []
 
+    print(f"Loading dataset from: {protocol_file}")
+    print(f"Audio directory: {audio_dir}")
+
+    if not os.path.exists(protocol_file):
+        print(f"ERROR: Protocol file not found: {protocol_file}")
+        return AudioDataset([], [], sample_rate, duration_seconds)
+
+    if not os.path.exists(audio_dir):
+        print(f"ERROR: Audio directory not found: {audio_dir}")
+        return AudioDataset([], [], sample_rate, duration_seconds)
+
     with open(protocol_file, 'r') as f:
-        for line in f:
+        for line_num, line in enumerate(f):
             parts = line.strip().split()
+
             if len(parts) < 4:
                 continue
 
+            # Формат ASVspoof 2019 LA:
+            # speaker_id file_id system_id label
+            # Пример: LA_0001 LA_0001_00001 bonafide -
+            # или: LA_0001 LA_0001_00002 A01 - spoof
+
             file_id = parts[1]
-            label_str = parts[4] if len(parts) > 4 else parts[3]
 
-            audio_path = os.path.join(audio_dir, f"{file_id}.flac")
-            if not os.path.exists(audio_path):
-                audio_path = os.path.join(audio_dir, f"{file_id}.wav")
+            # Label может быть в позиции 3 или 4 в зависимости от формата
+            if len(parts) >= 5:
+                label_str = parts[4]
+            else:
+                label_str = parts[3]
 
-            if os.path.exists(audio_path):
-                audio_files.append(audio_path)
-                label = 1.0 if label_str == "spoof" else 0.0
-                labels.append(label)
+            # Проверяем разные расширения
+            audio_path = None
+            for ext in ['.wav', '.flac']:
+                candidate = os.path.join(audio_dir, f"{file_id}{ext}")
+                if os.path.exists(candidate):
+                    audio_path = candidate
+                    break
+
+            if audio_path is None:
+                if line_num < 5:
+                    print(f"WARNING: Audio file not found for {file_id}")
+                continue
+
+            audio_files.append(audio_path)
+            label = 1.0 if label_str == "spoof" else 0.0
+            labels.append(label)
+
+    print(f"Loaded {len(audio_files)} files")
 
     return AudioDataset(audio_files, labels, sample_rate, duration_seconds)

@@ -7,7 +7,7 @@ from infrastructure import ParameterSchema
 from module1 import Module1
 from module2 import Module2
 from train.config import TrainingConfig
-from train.dataset import AudioDataset
+from train.dataset import AudioDataset, load_asvspoof_dataset
 from train.utils import save_checkpoint, load_checkpoint, setup_logging
 
 
@@ -124,18 +124,18 @@ def train_module2(
 if __name__ == "__main__":
     config = TrainingConfig()
 
-    train_dataset = AudioDataset(
-        audio_files=["data/libritts/train/*.wav"],
-        labels=[0] * 1000,
+    train_dataset = load_asvspoof_dataset(
+        protocol_file="E:\\data\\ASVspoof2019LA\\CM_protocol\\CM_train.trn",
+        audio_dir="E:\\data\\ASVspoof2019LA\\WAV\\train",
         sample_rate=config.sample_rate,
         duration_seconds=config.duration_seconds
     )
 
-    val_dataset = AudioDataset(
-        audio_files=["data/libritts/val/*.wav"],
-        labels=[0] * 100,
+    val_dataset = load_asvspoof_dataset(
+        protocol_file="E:\\data\\ASVspoof2019LA\\CM_protocol\\CM_dev.trl",
+        audio_dir="E:\\data\\ASVspoof2019LA\\WAV\\dev",
         sample_rate=config.sample_rate,
         duration_seconds=config.duration_seconds
     )
 
-    train_module2(config, train_dataset, val_dataset)
+    train_module1(config, train_dataset, val_dataset)  # или train_module2

@@ -4,8 +4,8 @@ from typing import Optional
 
 @dataclass
 class TrainingConfig:
-    batch_size: int = 16
-    num_workers: int = 4
+    batch_size: int = 4
+    num_workers: int = 2
     num_epochs: int = 50
     learning_rate: float = 1e-4
     weight_decay: float = 1e-4
@@ -25,9 +25,9 @@ class TrainingConfig:
     device: str = "cuda"
     seed: int = 42
 
-    dataset_real: str = "data/libritts"
-    dataset_fake: str = "data/asvspoof2019"
-    dataset_test: str = "data/asvspoof2021"
+    dataset_real: str = "E:\\data\\ASVspoof2019LA"
+    dataset_fake: str = "E:\\data\\ASVspoof2019LA"
+    dataset_test: str = "E:\\data\\ASVspoof2019LA"
 
     sample_rate: int = 16000
     duration_seconds: float = 4.0

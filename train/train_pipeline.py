@@ -188,22 +188,22 @@ if __name__ == "__main__":
     config = TrainingConfig()
 
     train_dataset = load_asvspoof_dataset(
-        protocol_file="data/asvspoof2019/CM/trial_metadata.txt",
-        audio_dir="data/asvspoof2019/CM/ASVspoof2019_LA_train/flac",
+        protocol_file="E:\\data\\ASVspoof2019LA\\CM_protocol\\CM_train.trn",
+        audio_dir="E:\\data\\ASVspoof2019LA\\WAV\\train",
         sample_rate=config.sample_rate,
         duration_seconds=config.duration_seconds
     )
 
     val_dataset = load_asvspoof_dataset(
-        protocol_file="data/asvspoof2019/CM/trial_metadata.txt",
-        audio_dir="data/asvspoof2019/CM/ASVspoof2019_LA_dev/flac",
+        protocol_file="E:\\data\\ASVspoof2019LA\\CM_protocol\\CM_dev.trl",
+        audio_dir="E:\\data\\ASVspoof2019LA\\WAV\\dev",
         sample_rate=config.sample_rate,
         duration_seconds=config.duration_seconds
     )
 
     test_dataset = load_asvspoof_dataset(
-        protocol_file="data/asvspoof2021/DF/trial_metadata.txt",
-        audio_dir="data/asvspoof2021/DF/ASVspoof2021_DF_eval/flac",
+        protocol_file="E:\\data\\ASVspoof2019LA\\CM_protocol\\CM_eval.trl",
+        audio_dir="E:\\data\\ASVspoof2019LA\\WAV\\eval",
         sample_rate=config.sample_rate,
         duration_seconds=config.duration_seconds
     )
