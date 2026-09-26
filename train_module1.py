@@ -11,7 +11,7 @@ from train.config import TrainingConfig
 from train.dataset import AudioDataset, load_asvspoof_dataset
 from train.losses import MultiScaleSpectralLoss
 from train.utils import (
-    save_checkpoint, setup_logging, setup_cuda_optimizations, memory_cleanup
+    save_checkpoint, setup_logging, setup_cuda_optimizations, memory_cleanup, load_checkpoint
 )
 
 
@@ -117,8 +117,26 @@ def train_module1(
 
     best_val_loss = float('inf')
     global_step = 0
+    start_epoch = 0
 
-    for epoch in range(config.num_epochs):
+    # === ЛОГИКА ВОЗОБНОВЛЕНИЯ ОБУЧЕНИЯ ===
+    checkpoint_path = os.path.join(config.checkpoint_dir, "module1_best.pth")
+
+    if os.path.exists(checkpoint_path):
+        logger.info(f"Found checkpoint: {checkpoint_path}. Resuming training...")
+        start_epoch = load_checkpoint(model, optimizer, checkpoint_path, device)
+
+        # Если вы сохраняли состояние планировщика (scheduler), его тоже нужно загрузить:
+        # scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        logger.info(f"Resumed from epoch {start_epoch + 1}")
+    else:
+        logger.info("No checkpoint found. Starting training from scratch.")
+    # ======================================
+
+    global_step = start_epoch * len(train_loader)  # Для корректного логирования шагов
+
+    for epoch in range(start_epoch, config.num_epochs):  # <--- Цикл начинается с start_epoch
         model.train()
         train_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
@@ -224,9 +242,16 @@ def train_module1(
         else:
             logger.info(f"Epoch {epoch+1}/{config.num_epochs}, Train Loss: {train_loss:.4f}")
 
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            save_checkpoint(model, optimizer, epoch, val_loss, config.checkpoint_dir, "module1_best.pth")
+            logger.info(f"Saved best model with val loss: {val_loss:.4f}")
+
+            # Сохраняем "последний" чекпоинт для возможности прервать и продолжить обучение
+        save_checkpoint(model, optimizer, epoch, val_loss, config.checkpoint_dir, "module1_latest.pth")
+
         scheduler.step()
 
-        # Периодическая очистка кэша
         if (epoch + 1) % config.empty_cache_every_n_epochs == 0:
             memory_cleanup()
 

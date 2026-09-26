@@ -97,7 +97,7 @@ def load_checkpoint(
         checkpoint_path: str,
         device: torch.device
 ) -> int:
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     model.load_state_dict(checkpoint['model_state_dict'])
 
